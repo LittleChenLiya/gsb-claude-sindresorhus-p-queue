@@ -159,6 +159,44 @@ For example, with `intervalCap: 2` and `interval: 1000`:
 > [!NOTE]
 > The `carryoverIntervalCount` option has no effect when `strict` mode is enabled, as strict mode tracks actual execution timestamps rather than counting pending tasks.
 
+##### aging
+
+Type: `{period: number, clock?: () => number}`\
+Default: `undefined`
+
+Enable aging so long-waiting tasks gain effective priority over time and are not starved by a stream of fresh high-priority tasks.
+
+The original `priority` is only the baseline. The effective priority of a waiting task is:
+
+```
+priority + floor(waited / period)
+```
+
+where `waited` is the time between the task being enqueued and the current clock reading. When two tasks have the same effective priority, they are dequeued in enqueue order. Updating a task's priority with [`.setPriority()`](#setpriorityid-priority) does not reset its waiting time.
+
+Aging is computed lazily when a task is dequeued; no polling timers are started. If the clock moves backwards, the waited time is clamped to `0`, so the effective priority never drops below the baseline.
+
+```js
+import PQueue from 'p-queue';
+
+let now = 0;
+const queue = new PQueue({
+	concurrency: 1,
+	aging: {
+		period: 10,
+		clock: () => now, // Virtual clock; defaults to Date.now
+	},
+});
+
+queue.add(() => 'old', {priority: 0});
+
+// Advance the virtual clock by 3 periods before enqueuing a higher-priority task.
+now += 30;
+queue.add(() => 'new', {priority: 2});
+
+// The old task has effective priority 3 and runs before the new task with priority 2.
+```
+
 ### queue
 
 `PQueue` instance.

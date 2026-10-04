@@ -2,7 +2,12 @@ import {EventEmitter} from 'eventemitter3';
 import pTimeout from 'p-timeout';
 import {type Queue, type RunFunction} from './queue.js';
 import PriorityQueue from './priority-queue.js';
-import {type QueueAddOptions, type Options, type TaskOptions} from './options.js';
+import {
+	type QueueAddOptions,
+	type Options,
+	type TaskOptions,
+	type AgingOptions,
+} from './options.js';
 
 type Task<TaskResultType> =
 	| ((options: TaskOptions) => PromiseLike<TaskResultType>)
@@ -40,13 +45,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	readonly #strict: boolean;
 
+	readonly #aging: AgingOptions | undefined;
+
 	// Circular buffer implementation for better performance
 	#strictTicks: number[] = [];
 	#strictTicksStartIndex = 0;
 
 	#queue: QueueType;
 
-	readonly #queueClass: new () => QueueType;
+	readonly #queueClass: new (options?: {readonly aging?: AgingOptions}) => QueueType;
 
 	#pending = 0;
 
@@ -123,7 +130,8 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		this.#intervalCap = options.intervalCap;
 		this.#interval = options.interval;
 		this.#strict = options.strict!;
-		this.#queue = new options.queueClass!();
+		this.#aging = options.aging;
+		this.#queue = new options.queueClass!({aging: options.aging});
 		this.#queueClass = options.queueClass!;
 		this.concurrency = options.concurrency!;
 
@@ -617,7 +625,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			cleanupQueueAbortHandler();
 		}
 
-		this.#queue = new this.#queueClass();
+		this.#queue = new this.#queueClass({aging: this.#aging});
 
 		// Clear interval timer since queue is now empty (consistent with #tryToStartAnother)
 		this.#clearIntervalTimer();
