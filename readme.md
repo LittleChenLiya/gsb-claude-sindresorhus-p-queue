@@ -846,6 +846,43 @@ const queue = new PQueue({queueClass: QueueClass});
 
 `p-queue` will call corresponding methods to put and get operations from this queue.
 
+## Aging priority queue
+
+`AgingPriorityQueue` is an optional drop-in `queueClass` that prevents starvation: a task's effective priority grows by `+1` every `agingPeriod` milliseconds it spends waiting, so long-waiting low-priority tasks eventually overtake newer high-priority ones. The default `PriorityQueue` is unchanged.
+
+- The `priority` option is only a baseline. Effective priority is `basePriority + floor(waitedMs / agingPeriod)`.
+- Aging is computed lazily at dequeue time only. No timers or polling are started.
+- Ties in effective priority are broken by original enqueue order (stable FIFO).
+- `setPriority()` updates the baseline without resetting the accumulated wait time.
+- Cancelled tasks are removed immediately and never count towards `size`.
+- The clock is injectable via the `now` option, which makes aging deterministic in tests. If the clock moves backwards, elapsed wait time is clamped to zero so a rollback can never decrease a task's effective priority.
+
+```js
+import PQueue, {AgingPriorityQueue} from 'p-queue';
+
+// +1 effective priority per 10ms of waiting.
+class AgingQueue extends AgingPriorityQueue {
+	constructor() {
+		super({agingPeriod: 10});
+	}
+}
+
+const queue = new PQueue({concurrency: 1, queueClass: AgingQueue});
+```
+
+With a virtual clock for tests:
+
+```js
+let now = 0;
+const queue = new AgingPriorityQueue({agingPeriod: 10, now: () => now});
+
+queue.enqueue(lowPriorityTask, {priority: 0});
+now += 30; // Effective priority is now 0 + 3 = 3.
+queue.enqueue(urgentTask, {priority: 2});
+
+queue.dequeue(); // => lowPriorityTask (effective 3 beats 2)
+```
+
 ## FAQ
 
 #### How do the `concurrency` and `intervalCap` options affect each other?
