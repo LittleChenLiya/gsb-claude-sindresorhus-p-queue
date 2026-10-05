@@ -24,6 +24,36 @@ type TimeoutOptions = {
 	timeout?: number;
 };
 
+/**
+Determines when a concurrency slot is released for a task that has a `timeout`.
+
+- `'release'` (default): The slot is released as soon as the caller-facing promise rejects with a `TimeoutError`, even if the underlying function is still running.
+- `'strict'`: The slot is held until the underlying function's promise actually settles. A timed-out task keeps occupying its concurrency slot, so queued tasks only start once the timed-out function truly finishes. The function is never force-terminated — non-cooperative functions may hold their slot indefinitely.
+*/
+export type TimeoutSlotPolicy = 'release' | 'strict';
+
+type TimeoutSlotPolicyOptions = {
+	/**
+	When a concurrency slot is released for a task that times out.
+
+	@default 'release'
+
+	Can be overridden per task using the `timeoutSlotPolicy` option in `.add()`:
+
+	@example
+	```
+	const queue = new PQueue({concurrency: 1, timeout: 1000, timeoutSlotPolicy: 'strict'});
+
+	// This task keeps its slot until its promise settles, even after timing out
+	await queue.add(() => slowTask());
+
+	// This task releases its slot as soon as it times out
+	await queue.add(() => otherTask(), {timeoutSlotPolicy: 'release'});
+	```
+	*/
+	timeoutSlotPolicy?: TimeoutSlotPolicy;
+};
+
 export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOptions extends QueueAddOptions> = {
 	/**
 	Concurrency limit.
@@ -92,7 +122,7 @@ export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOpt
 	The `carryoverIntervalCount` option has no effect when `strict` mode is enabled, as strict mode tracks actual execution timestamps rather than counting pending tasks.
 	*/
 	readonly strict?: boolean;
-} & TimeoutOptions;
+} & TimeoutOptions & TimeoutSlotPolicyOptions;
 
 export type QueueAddOptions = {
 	/**
@@ -106,7 +136,7 @@ export type QueueAddOptions = {
 	Unique identifier for the promise function, used to update its priority before execution. If not specified, it is auto-assigned an incrementing BigInt starting from `1n`.
 	*/
 	id?: string;
-} & TaskOptions & TimeoutOptions;
+} & TaskOptions & TimeoutOptions & TimeoutSlotPolicyOptions;
 
 export type TaskOptions = {
 	/**

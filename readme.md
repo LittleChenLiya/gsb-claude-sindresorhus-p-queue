@@ -104,6 +104,18 @@ await queue.add(() => fetchData());
 await queue.add(() => slowTask(), {timeout: 10000});
 ```
 
+##### timeoutSlotPolicy
+
+Type: `'release' | 'strict'`\
+Default: `'release'`
+
+Determines when a concurrency slot is released for a task that has a `timeout`.
+
+- `'release'` (default): The slot is released as soon as the caller-facing promise rejects with a `TimeoutError`, even if the underlying function is still running.
+- `'strict'`: The slot is held until the underlying function's promise actually settles. A timed-out task keeps occupying its concurrency slot, so queued tasks only start once the timed-out function truly finishes. A late result never overrides the already-rejected result. The function is never force-terminated — non-cooperative functions may hold their slot indefinitely.
+
+Can be overridden per task using the `timeoutSlotPolicy` option in `.add()`. See [Handling timeouts](#handling-timeouts) for an example.
+
 ##### autoStart
 
 Type: `boolean`\
@@ -197,6 +209,13 @@ Priority of operation. Operations with greater priority will be scheduled first.
 Type `string`
 
 Unique identifier for the promise function, used to update its priority before execution. If not specified, it is auto-assigned an incrementing BigInt starting from `1n`.
+
+##### timeoutSlotPolicy
+
+Type: `'release' | 'strict'`\
+Default: The queue's `timeoutSlotPolicy` option
+
+Per-task override of the queue's [`timeoutSlotPolicy`](#timeoutslotpolicy) option. Only takes effect when the task also has a `timeout`.
 
 ##### signal
 
@@ -419,6 +438,32 @@ Here, the promise function with `id: '🦀'` executes last.
 #### .pending
 
 Number of running items (no longer in the queue).
+
+With `timeoutSlotPolicy: 'strict'`, this includes timed-out tasks whose underlying promise has not settled yet, because they still occupy their concurrency slot. Use `.stats` to distinguish actually-running tasks from timed-out in-flight tasks.
+
+#### .stats
+
+Type: `{waiting: number, running: number, timedOut: number}`
+
+Queue statistics, distinguishing tasks that are waiting in the queue, actually running, and timed out but still occupying a concurrency slot (`timeoutSlotPolicy: 'strict'` only).
+
+- `waiting`: tasks queued and not yet started (same as `.size`).
+- `running`: tasks currently executing that have not timed out.
+- `timedOut`: tasks whose caller-facing promise already rejected with a `TimeoutError` but whose underlying promise has not settled yet. These still hold their concurrency slot.
+
+All counts return to `0` once the queue is idle and every in-flight task has settled.
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({concurrency: 1, timeout: 1000, timeoutSlotPolicy: 'strict'});
+
+queue.add(() => fetchData(1));
+queue.add(() => fetchData(2));
+
+console.log(queue.stats);
+// => {waiting: 1, running: 1, timedOut: 0}
+```
 
 #### [.timeout](#timeout)
 
@@ -810,6 +855,49 @@ const queue = new PQueue({
 		timeout: undefined,
 	});
 })();
+```
+
+### Timeout slot policy
+
+By default (`timeoutSlotPolicy: 'release'`), a task that times out frees its concurrency slot immediately, even if its function is still running in the background. With `timeoutSlotPolicy: 'strict'`, the slot is held until the function's promise actually settles: the caller still gets a `TimeoutError` at the timeout, but the queue does not start the next task until the timed-out function truly finishes. A late result never overrides the already-rejected result, and the function is never force-terminated.
+
+Two-task example with `concurrency: 1` — the second task only starts after the first task's promise really settles, not when it times out:
+
+```js
+import PQueue, {TimeoutError} from 'p-queue';
+import delay from 'delay';
+
+const queue = new PQueue({
+	concurrency: 1,
+	timeout: 100,
+	timeoutSlotPolicy: 'strict',
+});
+
+// Task 1 takes 300ms but times out (for the caller) after 100ms.
+const first = queue.add(async () => {
+	await delay(300);
+	return 'late-success'; // Arrives after the timeout; never re-resolves the caller.
+});
+
+// Task 2 waits for the single slot. It starts only when task 1's
+// promise actually settles (at ~300ms), not when it times out (~100ms).
+const second = queue.add(async () => 'second');
+
+try {
+	await first;
+} catch (error) {
+	console.log(error instanceof TimeoutError); // true
+	console.log(queue.stats); // => {waiting: 1, running: 0, timedOut: 1}
+}
+
+console.log(await second); // 'second'
+console.log(queue.stats); // => {waiting: 0, running: 0, timedOut: 0}
+```
+
+The behavior is covered by deterministic virtual-time tests (mocked timers, no real waiting):
+
+```sh
+node --import=tsx/esm --test test/timeout-slot-policy.ts
 ```
 
 ## Custom QueueClass

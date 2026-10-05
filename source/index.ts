@@ -1,8 +1,13 @@
 import {EventEmitter} from 'eventemitter3';
-import pTimeout from 'p-timeout';
+import pTimeout, {TimeoutError} from 'p-timeout';
 import {type Queue, type RunFunction} from './queue.js';
 import PriorityQueue from './priority-queue.js';
-import {type QueueAddOptions, type Options, type TaskOptions} from './options.js';
+import {
+	type QueueAddOptions,
+	type Options,
+	type TaskOptions,
+	type TimeoutSlotPolicy,
+} from './options.js';
 
 type Task<TaskResultType> =
 	| ((options: TaskOptions) => PromiseLike<TaskResultType>)
@@ -50,6 +55,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#pending = 0;
 
+	// Number of tasks that timed out (caller already rejected) but whose underlying promise has not settled yet. Only non-zero when `timeoutSlotPolicy: 'strict'` is used. These tasks still occupy their concurrency slot.
+	#timedOutInFlight = 0;
+
 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
 	#concurrency!: number;
 
@@ -64,9 +72,12 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		priority: number;
 		startTime: number;
 		timeout?: number;
+		timedOut?: boolean;
 	}>();
 
 	readonly #queueAbortListenerCleanupFunctions = new Set<() => void>();
+
+	readonly #timeoutSlotPolicy: TimeoutSlotPolicy;
 
 	/**
 	Get or set the default timeout for all tasks. Can be changed at runtime.
@@ -97,6 +108,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			autoStart: true,
 			queueClass: PriorityQueue,
 			strict: false,
+			timeoutSlotPolicy: 'release',
 			...options,
 		} as Options<QueueType, EnqueueOptionsType>;
 
@@ -131,10 +143,20 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			throw new TypeError(`Expected \`timeout\` to be a positive finite number, got \`${options.timeout}\` (${typeof options.timeout})`);
 		}
 
+		this.#validateTimeoutSlotPolicy(options.timeoutSlotPolicy);
+		this.#timeoutSlotPolicy = options.timeoutSlotPolicy!;
+
 		this.timeout = options.timeout;
 		this.#isPaused = options.autoStart === false;
 
 		this.#setupRateLimitTracking();
+	}
+
+	#validateTimeoutSlotPolicy(policy: unknown): asserts policy is TimeoutSlotPolicy | undefined {
+		if (policy !== undefined && policy !== 'release' && policy !== 'strict') {
+			const got = typeof policy === 'string' ? `\`${policy}\`` : typeof policy;
+			throw new TypeError(`Expected \`timeoutSlotPolicy\` to be 'release' or 'strict', got ${got}`);
+		}
 	}
 
 	#cleanupStrictTicks(now: number): void {
@@ -442,6 +464,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		// Create a copy to avoid mutating the original options object
 		options = {
 			timeout: this.timeout,
+			timeoutSlotPolicy: this.#timeoutSlotPolicy,
 			...options,
 			// Assign unique ID if not provided
 			id: options.id ?? (this.#idAssigner++).toString(),
@@ -450,6 +473,8 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		if (options.timeout !== undefined && !(Number.isFinite(options.timeout) && options.timeout > 0)) {
 			throw new TypeError(`Expected \`timeout\` to be a positive finite number, got \`${options.timeout}\` (${typeof options.timeout})`);
 		}
+
+		this.#validateTimeoutSlotPolicy(options.timeoutSlotPolicy);
 
 		return new Promise((resolve, reject) => {
 			// Create a unique symbol for tracking this task
@@ -472,6 +497,11 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 				let eventListener: (() => void) | undefined;
 
+				// When `true`, the concurrency slot is not released by the `finally` below;
+				// it is released only when the underlying promise actually settles
+				// (`timeoutSlotPolicy: 'strict'`).
+				let slotReleaseDeferred = false;
+
 				try {
 					// Check abort signal - if aborted, need to decrement the counter
 					// that was incremented in tryToStartAnother
@@ -488,7 +518,58 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 					let operation = function_({signal: options.signal});
 
-					if (options.timeout !== undefined) {
+					if (options.timeout !== undefined && options.timeoutSlotPolicy === 'strict') {
+						// Strict timeout slot policy: the caller-facing promise rejects with a
+						// `TimeoutError` when the timeout elapses, but the concurrency slot is
+						// held until the underlying promise actually settles. A late result
+						// can never override the already-rejected result, and the function is
+						// never force-terminated.
+						const rawOperation = Promise.resolve(operation);
+						const taskInfo = this.#runningTasks.get(taskSymbol);
+						let timedOut = false;
+
+						const releaseSlot = () => {
+							this.#runningTasks.delete(taskSymbol);
+							if (timedOut) {
+								this.#timedOutInFlight--;
+							}
+
+							// Use queueMicrotask to prevent deep recursion while maintaining timing
+							queueMicrotask(() => {
+								this.#next();
+							});
+						};
+
+						// Attaching handlers here also ensures a late rejection of the
+						// underlying promise never surfaces as an unhandled rejection.
+						// eslint-disable-next-line promise/prefer-await-to-then, promise/prefer-catch
+						rawOperation.then(releaseSlot, releaseSlot);
+						slotReleaseDeferred = true;
+
+						const timeoutMessage = `Task timed out after ${options.timeout}ms (queue has ${this.#pending} running, ${this.#queue.size} waiting); `
+							+ 'concurrency slot is held until the task settles (timeoutSlotPolicy: strict)';
+
+						let timeoutId: NodeJS.Timeout | undefined;
+						const raced = Promise.race([
+							rawOperation,
+							new Promise<never>((_resolve, reject) => {
+								timeoutId = setTimeout(() => {
+									timedOut = true;
+									this.#timedOutInFlight++;
+									if (taskInfo) {
+										taskInfo.timedOut = true;
+									}
+
+									reject(new TimeoutError(timeoutMessage));
+								}, options.timeout);
+							}),
+						]);
+
+						// eslint-disable-next-line promise/prefer-await-to-then
+						operation = raced.finally(() => {
+							clearTimeout(timeoutId);
+						});
+					} else if (options.timeout !== undefined) {
 						operation = pTimeout(Promise.resolve(operation), {
 							milliseconds: options.timeout,
 							message: `Task timed out after ${options.timeout}ms (queue has ${this.#pending} running, ${this.#queue.size} waiting)`,
@@ -519,13 +600,17 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 						options.signal?.removeEventListener('abort', eventListener);
 					}
 
-					// Remove from running tasks
-					this.#runningTasks.delete(taskSymbol);
+					// With `timeoutSlotPolicy: 'strict'`, slot release is deferred to the
+					// underlying promise's real settlement (see `releaseSlot` above).
+					if (!slotReleaseDeferred) {
+						// Remove from running tasks
+						this.#runningTasks.delete(taskSymbol);
 
-					// Use queueMicrotask to prevent deep recursion while maintaining timing
-					queueMicrotask(() => {
-						this.#next();
-					});
+						// Use queueMicrotask to prevent deep recursion while maintaining timing
+						queueMicrotask(() => {
+							this.#next();
+						});
+					}
 				}
 			};
 
@@ -807,9 +892,40 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	/**
 	Number of running items (no longer in the queue).
+
+	With `timeoutSlotPolicy: 'strict'`, this includes timed-out tasks whose underlying promise has not settled yet, because they still occupy their concurrency slot. Use `queue.stats` to distinguish actually-running tasks from timed-out in-flight tasks.
 	*/
 	get pending(): number {
 		return this.#pending;
+	}
+
+	/**
+	Queue statistics, distinguishing tasks that are waiting in the queue, actually running, and timed out but still occupying a concurrency slot (`timeoutSlotPolicy: 'strict'` only).
+
+	- `waiting`: tasks queued and not yet started (same as `queue.size`).
+	- `running`: tasks currently executing that have not timed out.
+	- `timedOut`: tasks whose caller-facing promise already rejected with a `TimeoutError` but whose underlying promise has not settled yet. These still hold their concurrency slot.
+
+	All counts return to `0` once the queue is idle and every in-flight task has settled.
+
+	```js
+	import PQueue from 'p-queue';
+
+	const queue = new PQueue({concurrency: 1, timeout: 1000, timeoutSlotPolicy: 'strict'});
+
+	queue.add(() => fetchData(1));
+	queue.add(() => fetchData(2));
+
+	console.log(queue.stats);
+	// => {waiting: 1, running: 1, timedOut: 0}
+	```
+	*/
+	get stats(): {readonly waiting: number; readonly running: number; readonly timedOut: number} {
+		return {
+			waiting: this.#queue.size,
+			running: this.#pending - this.#timedOutInFlight,
+			timedOut: this.#timedOutInFlight,
+		};
 	}
 
 	/**
@@ -930,7 +1046,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	}
 
 	/**
-	The tasks currently being executed. Each task includes its `id`, `priority`, `startTime`, `timeout` (if set), and `timeoutRemaining` (milliseconds until the task times out, or `undefined` if no timeout is set).
+	The tasks currently being executed. Each task includes its `id`, `priority`, `startTime`, `timeout` (if set), `timeoutRemaining` (milliseconds until the task times out, or `undefined` if no timeout is set), and `timedOut` (`true` when the caller-facing promise already rejected with a `TimeoutError` but the underlying promise is still in flight — only possible with `timeoutSlotPolicy: 'strict'`).
 
 	Returns an array of task info objects.
 
@@ -966,6 +1082,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		readonly startTime: number;
 		readonly timeout?: number;
 		readonly timeoutRemaining?: number;
+		readonly timedOut?: boolean;
 	}> {
 		// Return fresh array with fresh objects to prevent mutations
 		return [...this.#runningTasks.values()].map(task => ({
@@ -977,7 +1094,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 export type {Queue} from './queue.js';
 export {default as PriorityQueue} from './priority-queue.js';
-export {type QueueAddOptions, type Options} from './options.js';
+export {type QueueAddOptions, type Options, type TimeoutSlotPolicy} from './options.js';
 
 /**
 Error thrown when a task times out.
