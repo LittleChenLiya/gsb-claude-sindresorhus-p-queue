@@ -1,5 +1,5 @@
 import {EventEmitter} from 'eventemitter3';
-import pTimeout from 'p-timeout';
+import {TimeoutError} from 'p-timeout';
 import {type Queue, type RunFunction} from './queue.js';
 import PriorityQueue from './priority-queue.js';
 import {type QueueAddOptions, type Options, type TaskOptions} from './options.js';
@@ -39,6 +39,12 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#timeoutId?: NodeJS.Timeout;
 
 	readonly #strict: boolean;
+
+	// Timeout slot strategy: 'default' releases the slot on timeout, 'strict' holds it until the original promise settles
+	readonly #timeoutStrategy: 'default' | 'strict';
+
+	// Number of tasks whose function has timed out but is still running (slot held in strict mode)
+	#timedOut = 0;
 
 	// Circular buffer implementation for better performance
 	#strictTicks: number[] = [];
@@ -97,6 +103,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			autoStart: true,
 			queueClass: PriorityQueue,
 			strict: false,
+			timeoutStrategy: 'default',
 			...options,
 		} as Options<QueueType, EnqueueOptionsType>;
 
@@ -123,6 +130,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		this.#intervalCap = options.intervalCap;
 		this.#interval = options.interval;
 		this.#strict = options.strict!;
+		this.#timeoutStrategy = options.timeoutStrategy ?? 'default';
 		this.#queue = new options.queueClass!();
 		this.#queueClass = options.queueClass!;
 		this.concurrency = options.concurrency!;
@@ -471,6 +479,27 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 				});
 
 				let eventListener: (() => void) | undefined;
+				let callerSettled = false;
+				let taskTimedOut = false;
+
+				// Settles the caller's promise exactly once. Late results from the
+				// original function (e.g. after a timeout) are ignored and never
+				// overwrite an already-settled rejection.
+				const settleCaller = (error: unknown, result?: TaskResultType) => {
+					if (callerSettled) {
+						return;
+					}
+
+					callerSettled = true;
+
+					if (error === undefined) {
+						resolve(result as TaskResultType);
+						this.emit('completed', result);
+					} else {
+						reject(error);
+						this.emit('error', error);
+					}
+				};
 
 				try {
 					// Check abort signal - if aborted, need to decrement the counter
@@ -487,32 +516,121 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					}
 
 					let operation = function_({signal: options.signal});
+					// Save the original promise before it gets wrapped.
+					// This is needed for the strict timeout strategy to hold the slot
+					// until the original function truly settles.
+					const originalPromise = Promise.resolve(operation);
 
 					if (options.timeout !== undefined) {
-						operation = pTimeout(Promise.resolve(operation), {
-							milliseconds: options.timeout,
-							message: `Task timed out after ${options.timeout}ms (queue has ${this.#pending} running, ${this.#queue.size} waiting)`,
+						// Create a timeout promise that resolves with a marker instead of
+						// rejecting. This avoids unhandled promise rejections entirely.
+						let timeoutTimer: NodeJS.Timeout | undefined;
+						const TIMEOUT_MARKER = Symbol('timeout');
+						const timeoutPromise = new Promise<symbol>(resolve => {
+							timeoutTimer = setTimeout(() => {
+								resolve(TIMEOUT_MARKER);
+							}, options.timeout);
 						});
+
+						// Race the original against the timeout. The timeout resolves with
+						// a marker, so no unhandled rejections are possible.
+						let racedPromise: Promise<TaskResultType | symbol> = Promise.race([originalPromise, timeoutPromise]);
+
+						// Also race against the abort signal if provided
+						if (options.signal) {
+							const {signal} = options;
+
+							racedPromise = Promise.race([racedPromise, new Promise<never>((_resolve, reject) => {
+								eventListener = () => {
+									reject(signal.reason);
+								};
+
+								signal.addEventListener('abort', eventListener, {once: true});
+							})]);
+						}
+
+						const clearTimeoutTimer = () => {
+							if (timeoutTimer !== undefined) {
+								clearTimeout(timeoutTimer);
+								timeoutTimer = undefined;
+							}
+						};
+
+						if (this.#timeoutStrategy === 'strict') {
+							// Strict timeout strategy: the timeout rejects the caller, but the
+							// concurrency slot is held until the original function promise truly
+							// settles. A late resolve/reject from the original is ignored.
+							try {
+								const result = await racedPromise;
+								// Clear the timeout timer immediately after the race settles.
+								// Otherwise the timer could fire while we wait for the original
+								// promise to settle below, causing a spurious timeout.
+								clearTimeoutTimer();
+								if (result === TIMEOUT_MARKER) {
+									taskTimedOut = true;
+									this.#timedOut++;
+									settleCaller(new TimeoutError(`Task timed out after ${options.timeout}ms (queue has ${this.#pending} running, ${this.#queue.size} waiting)`));
+								} else {
+									settleCaller(undefined, result as TaskResultType);
+								}
+							} catch (error) {
+								clearTimeoutTimer();
+								settleCaller(error);
+							}
+
+							// Hold the slot until the original function truly settles.
+							// This is the key difference from the default strategy: with
+							// concurrency 1, the next task only starts after this one ends.
+							await originalPromise.catch(() => {});
+
+							if (taskTimedOut) {
+								this.#timedOut--;
+							}
+						} else {
+							// Default timeout strategy: release the slot as soon as the timeout
+							// fires, even if the underlying function is still running. The next
+							// task can start immediately. The function is never forcibly terminated.
+							// Track timed-out in-flight count in the background
+							originalPromise.finally(() => {
+								if (taskTimedOut) {
+									this.#timedOut--;
+								}
+							});
+
+							try {
+								const result = await racedPromise;
+								clearTimeoutTimer();
+								if (result === TIMEOUT_MARKER) {
+									taskTimedOut = true;
+									this.#timedOut++;
+									settleCaller(new TimeoutError(`Task timed out after ${options.timeout}ms (queue has ${this.#pending} running, ${this.#queue.size} waiting)`));
+								} else {
+									settleCaller(undefined, result as TaskResultType);
+								}
+							} catch (error) {
+								clearTimeoutTimer();
+								settleCaller(error);
+							}
+						}
+					} else {
+						// No timeout
+						if (options.signal) {
+							const {signal} = options;
+
+							operation = Promise.race([operation, new Promise<never>((_resolve, reject) => {
+								eventListener = () => {
+									reject(signal.reason);
+								};
+
+									signal.addEventListener('abort', eventListener, {once: true});
+								})]);
+						}
+
+						const result = await operation;
+						settleCaller(undefined, result);
 					}
-
-					if (options.signal) {
-						const {signal} = options;
-
-						operation = Promise.race([operation, new Promise<never>((_resolve, reject) => {
-							eventListener = () => {
-								reject(signal.reason);
-							};
-
-							signal.addEventListener('abort', eventListener, {once: true});
-						})]);
-					}
-
-					const result = await operation;
-					resolve(result);
-					this.emit('completed', result);
 				} catch (error: unknown) {
-					reject(error);
-					this.emit('error', error);
+					settleCaller(error);
 				} finally {
 					// Clean up abort event listener
 					if (eventListener) {
@@ -813,6 +931,29 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	}
 
 	/**
+	Number of tasks whose function has timed out but is still running in the background.
+
+	In the default timeout strategy these tasks no longer hold a concurrency slot, so they are not counted in `pending`. In the strict timeout strategy they still hold a slot, so they are counted in both `pending` and `timedOut`.
+	*/
+	get timedOut(): number {
+		return this.#timedOut;
+	}
+
+	/**
+	Number of tasks that are actually running (holding a concurrency slot and not timed out).
+
+	In the default strategy timed-out tasks no longer hold a slot, so this equals `pending`.
+	In the strict strategy timed-out tasks still hold a slot, so this equals `pending - timedOut`.
+	*/
+	get running(): number {
+		if (this.#timeoutStrategy === 'strict') {
+			return this.#pending - this.#timedOut;
+		}
+
+		return this.#pending;
+	}
+
+	/**
 	Whether the queue is currently paused.
 	*/
 	get isPaused(): boolean {
@@ -979,6 +1120,8 @@ export type {Queue} from './queue.js';
 export {default as PriorityQueue} from './priority-queue.js';
 export {type QueueAddOptions, type Options} from './options.js';
 
+export {TimeoutError};
+
 /**
 Error thrown when a task times out.
 
@@ -997,4 +1140,3 @@ try {
 }
 ```
 */
-export {TimeoutError} from 'p-timeout';

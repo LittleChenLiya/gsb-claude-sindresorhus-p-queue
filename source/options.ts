@@ -22,6 +22,32 @@ type TimeoutOptions = {
 	```
 	*/
 	timeout?: number;
+
+	/**
+	Controls whether the concurrency slot is released when a task times out.
+
+	- `'default'` — The slot is released as soon as the timeout fires, even if the underlying function is still running. The next task can start immediately. This is the default and matches the behavior of p-queue before this option existed.
+	- `'strict'` — The slot is held until the original function promise settles (resolves or rejects), even though the caller already received a `TimeoutError`. This guarantees that with `concurrency: 1`, a timed-out task blocks the next task until the first function truly ends. Late results from the original function are ignored and never overwrite the rejection.
+
+	In both modes the function itself is never forcibly terminated; a non-cooperative function keeps running in the background.
+
+	@default 'default'
+
+	@example
+	```
+	// Strict: the second task only starts after the first function truly ends
+	const queue = new PQueue({concurrency: 1, timeout: 100, timeoutStrategy: 'strict'});
+
+	queue.add(async () => {
+		await delay(500); // Times out at 100ms, but the slot is held until ~500ms
+	});
+
+	queue.add(async () => {
+		// Starts at ~500ms, not ~100ms
+	});
+	```
+	*/
+	timeoutStrategy?: 'default' | 'strict';
 };
 
 export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOptions extends QueueAddOptions> = {
