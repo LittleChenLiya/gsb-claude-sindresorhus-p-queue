@@ -846,6 +846,30 @@ const queue = new PQueue({queueClass: QueueClass});
 
 `p-queue` will call corresponding methods to put and get operations from this queue.
 
+### GroupQueue: weighted FIFO groups
+
+The bundled `GroupQueue` is an optional `queueClass` that splits the queue into independent FIFO groups and schedules the groups by weighted round-robin. Pass the group with each `.add()` call; the group identity comes only from the `group` option, never from the task function.
+
+- Each group is an independent FIFO. A `priority` only reorders tasks within their own group — it never becomes a global priority sort across groups.
+- A group's positive integer `groupWeight` is the number of tasks it may start per round while other groups have backlog. For example, with `alpha` at weight 2 and `beta` at weight 1, the start order while both have backlog is `alpha, alpha, beta`, repeating.
+- Empty groups do not accumulate credit, so a group that recovers from empty produces no burst.
+- Cancellation (via `AbortSignal`) and `setPriority()` still locate the original task inside its group, and the same input order always yields the same start sequence.
+
+```js
+import PQueue, {GroupQueue} from 'p-queue';
+
+const queue = new PQueue({concurrency: 1, queueClass: GroupQueue});
+
+queue.add(task, {group: 'alpha', groupWeight: 2});
+queue.add(otherTask, {group: 'beta'}); // Weight 1
+```
+
+See [`examples/group-queue.ts`](examples/group-queue.ts) for a runnable six-task example:
+
+```sh
+node --import=tsx/esm examples/group-queue.ts
+```
+
 ## FAQ
 
 #### How do the `concurrency` and `intervalCap` options affect each other?
