@@ -106,6 +106,20 @@ export type QueueAddOptions = {
 	Unique identifier for the promise function, used to update its priority before execution. If not specified, it is auto-assigned an incrementing BigInt starting from `1n`.
 	*/
 	id?: string;
+
+	/**
+	Group the task belongs to. Only used by queue classes that support grouping (e.g. `GroupedQueue`). Tasks within the same group are executed in FIFO order, and groups are scheduled by weight in a weighted round-robin.
+
+	@default 'default'
+	*/
+	group?: string;
+
+	/**
+	Number of starts the task's group gets per round. Must be a positive integer. Only used by queue classes that support grouping (e.g. `GroupedQueue`).
+
+	@default 1
+	*/
+	weight?: number;
 } & TaskOptions & TimeoutOptions;
 
 export type TaskOptions = {

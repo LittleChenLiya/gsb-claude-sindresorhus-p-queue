@@ -977,6 +977,8 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 export type {Queue} from './queue.js';
 export {default as PriorityQueue} from './priority-queue.js';
+export {default as GroupedQueue} from './grouped-queue.js';
+export {type GroupedQueueOptions} from './grouped-queue.js';
 export {type QueueAddOptions, type Options} from './options.js';
 
 /**
